@@ -115,9 +115,24 @@ class CPUBackend(BaseBackend):
     def __init__(self, target: tuple) -> None:
         super().__init__(target)
         self.binary_ext = "so"
-        self.cpu_arch = llvm.get_cpu_tripple().split("-")[0]
-        self.cpu_name = llvm.get_cpu_name()
-        self.cpu_features = llvm.get_cpu_features()
+
+        # Cross-compilation: TRITON_CPU_TARGET_CPU=arch:cpu (e.g., riscv64:sifive-x280)
+        target_cpu_env = os.getenv("TRITON_CPU_TARGET_CPU")
+        if target_cpu_env and ":" in target_cpu_env:
+            arch, cpu_name = target_cpu_env.split(":", 1)
+            self.cpu_arch = arch
+            self.cpu_name = cpu_name
+            self.target_triple = self._get_target_triple(arch)
+            llvm.init_targets()
+            print(self.target_triple, cpu_name)
+            features_str = llvm.get_target_cpu_features(self.target_triple, cpu_name)
+            self.cpu_features = set(f[1:] for f in features_str.split(",") if f.startswith("+"))
+        else:
+            self.target_triple = None
+            self.cpu_arch = llvm.get_cpu_tripple().split("-")[0]
+            self.cpu_name = llvm.get_cpu_name()
+            self.cpu_features = llvm.get_cpu_features()
+
         if 'amx-tile' in self.cpu_features:
             if not cpu.enable_amx():
                 import warnings
@@ -142,6 +157,20 @@ class CPUBackend(BaseBackend):
     def get_codegen_implementation(self, options):
         codegen_fns = {"min_dot_size": min_dot_size(self.target)}
         return codegen_fns
+
+    @staticmethod
+    def _get_target_triple(arch: str) -> str:
+        """Get default target triple for an architecture."""
+        triples = {
+            "riscv64": "riscv64-unknown-linux-gnu",
+            "riscv32": "riscv32-unknown-linux-gnu",
+            "aarch64": "aarch64-unknown-linux-gnu",
+            "arm64": "aarch64-unknown-linux-gnu",
+            "x86_64": "x86_64-unknown-linux-gnu",
+        }
+        if arch not in triples:
+            raise ValueError(f"Unknown architecture: {arch}. Supported: {list(triples.keys())}")
+        return triples[arch]
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         from triton.language.extra.cpu import libdevice
@@ -292,7 +321,11 @@ class CPUBackend(BaseBackend):
         llvm_mod = llvm.to_module(mod, context)
         if llvm_mod is None:
             raise RuntimeError("Failed to convert to LLVM IR")
-        llvm.set_host_target(llvm_mod)
+
+        if self.target_triple:
+            llvm.attach_datalayout(llvm_mod, self.target_triple, self.cpu_name, "")
+        else:
+            llvm.set_host_target(llvm_mod)
         #if options.extern_libs:
         #    paths = [path for (name, path) in options.extern_libs]
         #   llvm.link_extern_libs(llvm_mod, paths)
@@ -305,8 +338,11 @@ class CPUBackend(BaseBackend):
         del context
         return ret
 
-    @staticmethod
-    def make_asm(src, metadata, options):
+    def make_asm(self, src, metadata, options):
+        if self.target_triple:
+            llvm.init_targets()
+            return llvm.translate_to_asm(src, self.target_triple, self.cpu_name, "", [],
+                                         options.enable_fp_fusion, False)
         return llvm.translate_to_host_asm(src, options.enable_fp_fusion, options.enable_fast_math)
 
     @staticmethod
@@ -314,8 +350,15 @@ class CPUBackend(BaseBackend):
         with tempfile.TemporaryDirectory() as tmpdir:
             asm_path = os.path.join(tmpdir, "kernel.s")
             Path(asm_path).write_text(src)
-            lib_dirs = cpu_driver.library_dirs
-            libs = ["m", "TritonCPURuntime", "sleef"]
+
+            if os.getenv("TRITON_CPU_TARGET_CPU"):
+                cross_lib_dir = os.getenv("TRITON_CPU_CROSS_LIB_DIR")
+                lib_dirs = [cross_lib_dir] if cross_lib_dir else []
+                libs = ["m"]
+            else:
+                lib_dirs = cpu_driver.library_dirs
+                libs = ["m", "TritonCPURuntime", "sleef"]
+
             so = _build("kernel", asm_path, tmpdir, lib_dirs, cpu_driver.include_dirs, libs)
             with open(so, "rb") as f:
                 return f.read()

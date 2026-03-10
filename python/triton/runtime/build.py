@@ -31,6 +31,8 @@ def _build(name, src, srcdir, library_dirs, include_dirs, libraries):
     suffix = sysconfig.get_config_var('EXT_SUFFIX')
     system = platform.system()
     machine = platform.machine()
+    target_cpu_env = os.environ.get("TRITON_CPU_TARGET_CPU", "")
+    is_cross_compile = ":" in target_cpu_env
     so = os.path.join(srcdir, '{name}{suffix}'.format(name=name, suffix=suffix))
     # try to avoid setuptools if possible
     cc = os.environ.get("CC")
@@ -55,10 +57,11 @@ def _build(name, src, srcdir, library_dirs, include_dirs, libraries):
     include_dirs = include_dirs + [srcdir, py_include_dir, *custom_backend_dirs]
     # for -Wno-psabi, see https://gcc.gnu.org/bugzilla/show_bug.cgi?id=111047
     cc_cmd = [cc, src, "-O3", "-shared", "-fPIC", "-Wno-psabi", "-o", so]
-
+    if is_cross_compile:
+        cc_cmd += [f"-mcpu={target_cpu_env.split(':', 1)[1]}"]
     libraries += ["gcc"]
     # Use dynamic lookup to load Python library on Mac
-    if system == "Darwin":
+    if system == "Darwin" and not is_cross_compile:
         cc_cmd += ["-undefined", "dynamic_lookup"]
         # Don't use libgcc on clang + macos
         if "clang" in cc:
@@ -89,7 +92,7 @@ def _build(name, src, srcdir, library_dirs, include_dirs, libraries):
     if src.endswith(".s"):
         # This is required to properly parse .file directives
         cc_cmd += ["-g"]
-        if system == "Linux" and machine in ("aarch64", "arm64"):
+        if system == "Linux" and machine in ("aarch64", "arm64") and not is_cross_compile:
             # On Arm backend, some CPU (neoverse-v2) needs to be specified through -mcpu
             cc_cmd += ["-mcpu=native"]
     ret = subprocess.check_call(cc_cmd)

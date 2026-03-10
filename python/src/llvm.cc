@@ -12,6 +12,7 @@
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Linker/Linker.h"
+#include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Pass.h"
 #include "llvm/Passes/OptimizationLevel.h"
@@ -595,6 +596,36 @@ void init_triton_llvm(py::module &&m) {
   m.def("get_cpu_tripple", []() { return llvm::sys::getProcessTriple(); });
 
   m.def("get_cpu_name", []() { return llvm::sys::getHostCPUName().str(); });
+
+  // Get the feature string for a target CPU
+  m.def("get_target_cpu_features", [](const std::string &triple,
+                                      const std::string &cpu) {
+    std::string error;
+    auto target = llvm::TargetRegistry::lookupTarget(triple, error);
+    if (!target) {
+      throw std::runtime_error("target lookup error: " + error);
+    }
+    llvm::TargetOptions opt;
+    std::unique_ptr<llvm::TargetMachine> machine{target->createTargetMachine(
+        llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_)};
+    if (!machine) {
+      throw std::runtime_error("failed to create target machine");
+    }
+    // Get enabled features from MCSubtargetInfo
+    auto *STI = machine->getMCSubtargetInfo();
+    if (STI) {
+      auto features = STI->getEnabledProcessorFeatures();
+      std::string result;
+      for (const auto &f : features) {
+        if (!result.empty())
+          result += ",";
+        result += "+";
+        result += f.Key;
+      }
+      return result;
+    }
+    return std::string("");
+  });
 
   m.def("get_cpu_features", []() {
     auto features = llvm::sys::getHostCPUFeatures();
