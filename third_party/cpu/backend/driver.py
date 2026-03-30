@@ -394,198 +394,178 @@ PyMODINIT_FUNC PyInit___triton_cpu_launcher(void) {{
     return src
 
 
-def get_qemu_launcher_src():
-    """Return source for a generic QEMU launcher that works with any kernel.
+class QEMULauncher(object):
+    """Launcher that executes kernels via QEMU user-mode emulation."""
 
-    Protocol:
-    - Command line: <kernel.so> <kernel_name> <gridX> <gridY> <gridZ> <signature> [args...]
-    - signature is comma-separated types like "*fp32,*fp32,i32"
-    - For pointer args (*), the arg value is the size in bytes, data comes from stdin
-    - After execution, all pointer arg data is written back to stdout in order
-    """
-    return r"""
-#include <stdio.h>
+    def _get_or_compile_launcher(self, launcher_src):
+        key = hashlib.md5(launcher_src.encode("utf-8")).hexdigest()
+        cache = get_cache_manager(key)
+        launcher_path = cache.get_file("launcher")
+        if launcher_path and os.path.exists(launcher_path):
+            return launcher_path
+
+        # Compile launcher
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_path = os.path.join(tmpdir, "launcher.c")
+            with open(src_path, "w") as f:
+                f.write(launcher_src)
+
+            cc = os.environ.get("CC", "gcc")
+            target_cpu_env = os.environ.get("TRITON_CPU_TARGET_CPU", "")
+            launcher_bin = os.path.join(tmpdir, "launcher")
+            cc_cmd = [cc, src_path, "-o", launcher_bin, "-ldl", "-Wl,--export-dynamic"]
+            if ":" in target_cpu_env:
+                cc_cmd += [f"-mcpu={target_cpu_env.split(':', 1)[1]}"]
+            subprocess.check_call(cc_cmd)
+
+            with open(launcher_bin, "rb") as f:
+                launcher_path = cache.put(f.read(), "launcher", binary=True)
+
+        os.chmod(launcher_path, 0o755)
+        return launcher_path
+
+    def _generate_launcher_source(self, constants, signature):
+        """Generate C source for a launcher that calls kernel with exact signature."""
+
+        def _serialize_signature(sig):
+            if isinstance(sig, tuple):
+                return ','.join(map(_serialize_signature, sig))
+            return sig
+        signature = ','.join(map(_serialize_signature, signature.values()))
+        signature = list(filter(bool, signature.split(',')))
+        arg_types = [ty_to_cpp(ty) for ty in signature if ty and ty not in constants and ty != 'constexpr']
+        kernel_args = ', '.join(arg_types + ['uint32_t'] * 6)
+
+        # convert qemu inputs to kernel inputs
+        arg_defs = []
+        for i, arg_type in enumerate(arg_types):
+            # get argv value
+            arg_defs.append(f"char* val{i} = argv[6 + {i}];")
+            if '*' in arg_type:  # Pointer type - uses shared memory
+                arg_defs.append(f"""
+    {arg_type} arg{i};
+    if (strchr(val{i}, ':')) {{
+        // Shared memory format: "size:shm_name"
+        size_t size{i};
+        char shm_name{i}[256];
+        sscanf(val{i}, "%zu:%s", &size{i}, shm_name{i});
+
+        char shm_path{i}[300];
+        snprintf(shm_path{i}, sizeof(shm_path{i}), "{self.shared_mem_dir}%s", shm_name{i});
+
+        int fd{i} = open(shm_path{i}, O_RDWR);
+        if (fd{i} < 0) {{
+            fprintf(stderr, "Failed to open shared memory %s\\n", shm_path{i});
+            return 1;
+        }}
+
+        void* ptr{i} = mmap(NULL, size{i}, PROT_READ | PROT_WRITE, MAP_SHARED, fd{i}, 0);
+        close(fd{i});
+        if (ptr{i} == MAP_FAILED) {{
+            fprintf(stderr, "Failed to mmap shared memory\\n");
+            return 1;
+        }}
+        arg{i} = ({arg_type})ptr{i};
+    }} else {{
+        arg{i} = ({arg_type})(uintptr_t)strtoull(val{i}, NULL, 10);
+    }}""")
+            elif arg_type == 'float':
+                arg_defs.append(f"""
+    // Scalar float argument {i}
+    {arg_type} arg{i} = strtof(val{i}, NULL);""")
+            elif arg_type == 'double':
+                arg_defs.append(f"""
+    // Scalar double argument {i}
+    {arg_type} arg{i} = strtod(val{i}, NULL);""")
+            elif 'int64_t' in arg_type:
+                arg_defs.append(f"""
+    // int64 argument {i}
+    {arg_type} arg{i} = ({arg_type})strtoll(val{i}, NULL, 10);""")
+            elif 'uint64_t' in arg_type:
+                arg_defs.append(f"""
+    // uint64 argument {i}
+    {arg_type} arg{i} = ({arg_type})strtoull(val{i}, NULL, 10);""")
+            else:
+                arg_defs.append(f"""
+    // Integer argument {i}
+    {arg_type} arg{i} = ({arg_type})atoi(val{i});""")
+
+        arg_list = ', '.join([f"arg{i}" for i in range(len(arg_types))] +
+                            ['x', 'y', 'z', 'gridX', 'gridY', 'gridZ'])
+
+        return f"""#include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
-#define MAX_ARGS 32
+typedef void (*kernel_fn_t)({kernel_args});
 
-int main(int argc, char* argv[]) {
-    if (argc < 7) {
-        fprintf(stderr, "Usage: %s <kernel.so> <kernel_name> <gridX> <gridY> <gridZ> <signature> [args...]\n", argv[0]);
-        fprintf(stderr, "signature: comma-separated types like '*fp32,*fp32,i32'\n");
-        fprintf(stderr, "For pointer args, pass size and provide data via stdin\n");
+int main(int argc, char* argv[]) {{
+    if (argc < 6) {{
+        fprintf(stderr, "Usage: %s <kernel.so> <kernel_name> <gridX> <gridY> <gridZ> [args...]\\n", argv[0]);
         return 1;
-    }
+    }}
 
     const char* so_path = argv[1];
     const char* kernel_name = argv[2];
     uint32_t gridX = (uint32_t)atoi(argv[3]);
     uint32_t gridY = (uint32_t)atoi(argv[4]);
     uint32_t gridZ = (uint32_t)atoi(argv[5]);
-    const char* signature = argv[6];
 
-    // Parse signature to count args and identify types
-    char sig_copy[1024];
-    strncpy(sig_copy, signature, sizeof(sig_copy) - 1);
-    sig_copy[sizeof(sig_copy) - 1] = '\0';
+    // Preload TritonCPURuntime stub to provide triton_assert, etc.
+    void* runtime_handle = dlopen("/tmp/libTritonCPURuntime_riscv.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!runtime_handle) {{
+        fprintf(stderr, "Warning: Failed to preload TritonCPURuntime: %s\\n", dlerror());
+    }}
 
-    char* types[MAX_ARGS];
-    int num_args = 0;
-    char* tok = strtok(sig_copy, ",");
-    while (tok && num_args < MAX_ARGS) {
-        types[num_args++] = tok;
-        tok = strtok(NULL, ",");
-    }
-
-    if (argc < 7 + num_args) {
-        fprintf(stderr, "Expected %d args after signature, got %d\n", num_args, argc - 7);
+    // Load kernel with RTLD_GLOBAL to resolve dependencies
+    void* handle = dlopen(so_path, RTLD_LAZY | RTLD_GLOBAL);
+    if (!handle) {{
+        fprintf(stderr, "Failed to load %s: %s\\n", so_path, dlerror());
         return 1;
-    }
+    }}
 
-    // Storage for arguments
-    uint64_t args[MAX_ARGS];  // All args stored as 64-bit values
-    void* ptrs[MAX_ARGS];     // Allocated buffers for pointer args
-    size_t sizes[MAX_ARGS];   // Sizes for pointer args
-    int ptr_indices[MAX_ARGS];
-    int num_ptrs = 0;
-
-    // Parse arguments based on signature
-    for (int i = 0; i < num_args; i++) {
-        const char* ty = types[i];
-        const char* val = argv[7 + i];
-        ptrs[i] = NULL;
-        sizes[i] = 0;
-
-        if (ty[0] == '*') {
-            // Pointer arg: value is size, read data from stdin
-            size_t size = (size_t)strtoull(val, NULL, 10);
-            void* buf = malloc(size);
-            if (!buf) {
-                fprintf(stderr, "Failed to allocate %zu bytes for arg %d\n", size, i);
-                return 1;
-            }
-            if (fread(buf, 1, size, stdin) != size) {
-                fprintf(stderr, "Failed to read %zu bytes for arg %d\n", size, i);
-                return 1;
-            }
-            args[i] = (uint64_t)(uintptr_t)buf;
-            ptrs[i] = buf;
-            sizes[i] = size;
-            ptr_indices[num_ptrs++] = i;
-        } else if (strcmp(ty, "fp32") == 0 || strcmp(ty, "f32") == 0) {
-            float f = strtof(val, NULL);
-            memcpy(&args[i], &f, sizeof(f));
-        } else if (strcmp(ty, "fp64") == 0) {
-            double d = strtod(val, NULL);
-            memcpy(&args[i], &d, sizeof(d));
-        } else {
-            // Integer types
-            args[i] = (uint64_t)strtoull(val, NULL, 10);
-        }
-    }
-
-    // Load the kernel
-    void* handle = dlopen(so_path, RTLD_NOW);
-    if (!handle) {
-        fprintf(stderr, "Failed to load %s: %s\n", so_path, dlerror());
-        return 1;
-    }
-
-    void* kernel_ptr = dlsym(handle, kernel_name);
-    if (!kernel_ptr) {
-        fprintf(stderr, "Failed to find kernel %s: %s\n", kernel_name, dlerror());
+    kernel_fn_t kernel_ptr = (kernel_fn_t)dlsym(handle, kernel_name);
+    if (!kernel_ptr) {{
+        fprintf(stderr, "Failed to find %s: %s\\n", kernel_name, dlerror());
         dlclose(handle);
         return 1;
-    }
+    }}
 
-    // Execute kernel for each grid position
-    // We use inline asm or a function pointer cast trick to call with variable args
-    // For simplicity, support up to 8 kernel args + 6 grid args = 14 args total
-    size_t N = (size_t)gridX * gridY * gridZ;
+    // Parse arguments with correct types and handle shared memory
+{''.join(arg_defs)}
 
-    typedef void (*kernel_fn_t)(uint64_t, uint64_t, uint64_t, uint64_t,
-                                uint64_t, uint64_t, uint64_t, uint64_t,
-                                uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
-    kernel_fn_t fn = (kernel_fn_t)kernel_ptr;
+    // Execute kernel for each grid point
+    for (uint32_t gz = 0; gz < gridZ; gz++) {{
+        for (uint32_t gy = 0; gy < gridY; gy++) {{
+            for (uint32_t gx = 0; gx < gridX; gx++) {{
+                uint32_t x = gx;
+                uint32_t y = gy;
+                uint32_t z = gz;
+                kernel_ptr({arg_list});
+            }}
+        }}
+    }}
 
-    for (size_t i = 0; i < N; i++) {
-        uint32_t z = i / (gridX * gridY);
-        uint32_t y = (i / gridX) % gridY;
-        uint32_t x = i % gridX;
-
-        // Call with up to 8 args (pad with zeros if fewer)
-        fn(args[0], args[1], args[2], args[3],
-           args[4], args[5], args[6], args[7],
-           x, y, z, gridX, gridY, gridZ);
-    }
-
-    // Write pointer data back to stdout
-    for (int i = 0; i < num_ptrs; i++) {
-        int idx = ptr_indices[i];
-        fwrite(ptrs[idx], 1, sizes[idx], stdout);
-    }
-
-    // Cleanup
-    for (int i = 0; i < num_ptrs; i++) {
-        free(ptrs[ptr_indices[i]]);
-    }
     dlclose(handle);
     return 0;
-}
+}}
 """
 
-
-class QEMULauncher(object):
-    """Launcher that executes kernels via QEMU user-mode emulation."""
-    _launcher_path = None
-
-    @classmethod
-    def _get_launcher_path(cls):
-        if cls._launcher_path and os.path.exists(cls._launcher_path):
-            return cls._launcher_path
-
-        launcher_src = get_qemu_launcher_src()
-        cache = get_cache_manager(hashlib.md5(launcher_src.encode("utf-8")).hexdigest())
-        launcher_path = cache.get_file("qemu_launcher")
-
-        if launcher_path is None:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                src_path = os.path.join(tmpdir, "launcher.c")
-                with open(src_path, "w") as f:
-                    f.write(launcher_src)
-
-                cc = os.environ.get("CC", "gcc")
-                target_cpu_env = os.environ.get("TRITON_CPU_TARGET_CPU", "")
-                launcher_bin = os.path.join(tmpdir, "qemu_launcher")
-                cc_cmd = [cc, src_path, "-o", launcher_bin, "-ldl"]
-                if ":" in target_cpu_env:
-                    cc_cmd += [f"-mcpu={target_cpu_env.split(':', 1)[1]}"]
-                subprocess.check_call(cc_cmd)
-
-                with open(launcher_bin, "rb") as f:
-                    launcher_path = cache.put(f.read(), "qemu_launcher", binary=True)
-
-        os.chmod(launcher_path, 0o755)
-        cls._launcher_path = launcher_path
-        return launcher_path
-
     def __init__(self, src, metadata):
+        self.shared_mem_dir = f"/dev/shm/"
         self.metadata = metadata
         cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
         constants = src.constants if hasattr(src, "constants") else dict()
-        self.constants = {cst_key(key): value for key, value in constants.items()}
-        self.signature = {cst_key(key): value for key, value in src.signature.items()}
-
-        # Build signature string (e.g., "*fp32,*fp32,i32")
-        def _serialize_sig(sig):
-            return ','.join(map(_serialize_sig, sig)) if isinstance(sig, tuple) else sig
-        sig_list = [s for s in ','.join(map(_serialize_sig, self.signature.values())).split(',')
-                    if s and s != 'constexpr']
-        self.signature_str = ','.join(ty for i, ty in enumerate(sig_list) if i not in self.constants)
-        self.launcher_path = self._get_launcher_path()
+        constants = {cst_key(key): value for key, value in constants.items()}
+        signature = {cst_key(key): value for key, value in src.signature.items()}
+        launcher_src = self._generate_launcher_source(constants, signature)
+        self.launcher_path = self._get_or_compile_launcher(launcher_src)
 
     def launch(self, gridX, gridY, gridZ, stream, kernel_ptr, kernel_metadata,
                launch_metadata, launch_enter_hook, launch_exit_hook, *args):
@@ -600,31 +580,48 @@ class QEMULauncher(object):
             cmd += ["-L", qemu_lib_path]
 
         cmd += [self.launcher_path, kernel_ptr, getattr(self.metadata, 'name', 'kernel'),
-                str(gridX), str(gridY), str(gridZ), self.signature_str]
+                str(gridX), str(gridY), str(gridZ)]
 
-        tensor_info, stdin_data = [], b''
+        tensor_info = []
+        arg_idx = 0
         for arg in args:
+            # we use shared memory file to pass tensor data so that we can share
+            # between qemu device and host via mmap
             if hasattr(arg, 'data_ptr'):
-                nbytes = arg.numel() * arg.element_size()
-                cmd.append(str(nbytes))
-                stdin_data += bytes(ctypes.cast(arg.data_ptr(), ctypes.POINTER(ctypes.c_char * nbytes)).contents)
-                tensor_info.append((arg, nbytes))
+                storage = arg.untyped_storage()
+                storage_offset_bytes = arg.storage_offset() * arg.element_size()
+                nbytes = len(storage) - storage_offset_bytes
+                start_ptr = storage.data_ptr() + storage_offset_bytes
+
+                shm_name = f"triton_{os.getpid()}_{arg_idx}_{id(arg)}"
+                shm_path = self.shared_mem_dir + shm_name
+                with open(shm_path, "wb") as shm_f:
+                    data = bytes(ctypes.cast(start_ptr, ctypes.POINTER(ctypes.c_char * nbytes)).contents)
+                    shm_f.write(data)
+                cmd.append(f"{nbytes}:{shm_name}")
+                tensor_info.append((arg, nbytes, shm_path))
             else:
                 cmd.append(str(arg) if isinstance(arg, (int, float)) else str(int(arg)))
+            arg_idx += 1
 
         if launch_enter_hook:
             launch_enter_hook(launch_metadata)
-        result = subprocess.run(cmd, input=stdin_data, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True, timeout=10)
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
 
         if result.returncode != 0:
             raise RuntimeError(f"QEMU execution failed: {result.stderr.decode('utf-8', errors='replace')}")
 
-        offset = 0
-        for tensor, nbytes in tensor_info:
-            ctypes.memmove(tensor.data_ptr(), result.stdout[offset:offset + nbytes], nbytes)
-            offset += nbytes
+        # Read results from shared memory
+        for tensor, nbytes, shm_path in tensor_info:
+            with open(shm_path, "rb") as shm_f:
+                data = shm_f.read(nbytes)
+                storage = tensor.untyped_storage()
+                storage_offset_bytes = tensor.storage_offset() * tensor.element_size()
+                start_ptr = storage.data_ptr() + storage_offset_bytes
+                ctypes.memmove(start_ptr, data, nbytes)
+            os.unlink(shm_path)
 
     def __call__(self, *args, **kwargs):
         self.launch(*args, **kwargs)
