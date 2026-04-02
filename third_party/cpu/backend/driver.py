@@ -564,8 +564,20 @@ int main(int argc, char* argv[]) {{
         constants = src.constants if hasattr(src, "constants") else dict()
         constants = {cst_key(key): value for key, value in constants.items()}
         signature = {cst_key(key): value for key, value in src.signature.items()}
+
+        self.arg_names = src.fn.arg_names if hasattr(src, "fn") and hasattr(src.fn, "arg_names") else []
+
         launcher_src = self._generate_launcher_source(constants, signature)
         self.launcher_path = self._get_or_compile_launcher(launcher_src)
+
+    def _is_output_arg(self, arg_idx):
+        if not self.arg_names or arg_idx >= len(self.arg_names):
+            return True
+
+        arg_name = self.arg_names[arg_idx].lower()
+        output_keywords = ['out', 'output', 'result', 'dst', 'dest', 'write']
+
+        return any(keyword in arg_name for keyword in output_keywords)
 
     def launch(self, gridX, gridY, gridZ, stream, kernel_ptr, kernel_metadata,
                launch_metadata, launch_enter_hook, launch_exit_hook, *args):
@@ -599,7 +611,10 @@ int main(int argc, char* argv[]) {{
                     data = bytes(ctypes.cast(start_ptr, ctypes.POINTER(ctypes.c_char * nbytes)).contents)
                     shm_f.write(data)
                 cmd.append(f"{nbytes}:{shm_name}")
-                tensor_info.append((arg, nbytes, shm_path))
+
+                # Determine if this is an output parameter that needs copying back
+                is_output = self._is_output_arg(arg_idx)
+                tensor_info.append((arg, nbytes, shm_path, is_output))
             else:
                 cmd.append(str(arg) if isinstance(arg, (int, float)) else str(int(arg)))
             arg_idx += 1
@@ -613,14 +628,16 @@ int main(int argc, char* argv[]) {{
         if result.returncode != 0:
             raise RuntimeError(f"QEMU execution failed: {result.stderr.decode('utf-8', errors='replace')}")
 
-        # Read results from shared memory
-        for tensor, nbytes, shm_path in tensor_info:
-            with open(shm_path, "rb") as shm_f:
-                data = shm_f.read(nbytes)
-                storage = tensor.untyped_storage()
-                storage_offset_bytes = tensor.storage_offset() * tensor.element_size()
-                start_ptr = storage.data_ptr() + storage_offset_bytes
-                ctypes.memmove(start_ptr, data, nbytes)
+        # Read results from shared memory (only for output parameters)
+        for tensor, nbytes, shm_path, is_output in tensor_info:
+            if is_output:
+                # Copy modified data back from QEMU to host tensor
+                with open(shm_path, "rb") as shm_f:
+                    data = shm_f.read(nbytes)
+                    storage = tensor.untyped_storage()
+                    storage_offset_bytes = tensor.storage_offset() * tensor.element_size()
+                    start_ptr = storage.data_ptr() + storage_offset_bytes
+                    ctypes.memmove(start_ptr, data, nbytes)
             os.unlink(shm_path)
 
     def __call__(self, *args, **kwargs):
