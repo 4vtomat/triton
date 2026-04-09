@@ -440,15 +440,27 @@ class QEMULauncher(object):
         arg_defs = []
         for i, arg_type in enumerate(arg_types):
             # get argv value
-            arg_defs.append(f"char* val{i} = argv[6 + {i}];")
+            arg_defs.append(f"char* val{i} = argv[8 + {i}];")
             if '*' in arg_type:  # Pointer type - uses shared memory
                 arg_defs.append(f"""
     {arg_type} arg{i};
     if (strchr(val{i}, ':')) {{
-        // Shared memory format: "size:shm_name"
+        // Shared memory format: "storage_nbytes:shm_name:offset"
         size_t size{i};
         char shm_name{i}[256];
-        sscanf(val{i}, "%zu:%s", &size{i}, shm_name{i});
+        size_t offset{i} = 0;
+        char* first_colon{i} = strchr(val{i}, ':');
+        size{i} = (size_t)strtoull(val{i}, NULL, 10);
+        char* after_colon{i} = first_colon{i} + 1;
+        char* second_colon{i} = strchr(after_colon{i}, ':');
+        if (second_colon{i}) {{
+            size_t name_len{i} = second_colon{i} - after_colon{i};
+            memcpy(shm_name{i}, after_colon{i}, name_len{i});
+            shm_name{i}[name_len{i}] = '\\0';
+            offset{i} = (size_t)strtoull(second_colon{i} + 1, NULL, 10);
+        }} else {{
+            strcpy(shm_name{i}, after_colon{i});
+        }}
 
         char shm_path{i}[300];
         snprintf(shm_path{i}, sizeof(shm_path{i}), "{self.shared_mem_dir}%s", shm_name{i});
@@ -465,7 +477,7 @@ class QEMULauncher(object):
             fprintf(stderr, "Failed to mmap shared memory\\n");
             return 1;
         }}
-        arg{i} = ({arg_type})ptr{i};
+        arg{i} = ({arg_type})((char*)ptr{i} + offset{i});
     }} else {{
         arg{i} = ({arg_type})(uintptr_t)strtoull(val{i}, NULL, 10);
     }}""")
@@ -506,19 +518,21 @@ class QEMULauncher(object):
 typedef void (*kernel_fn_t)({kernel_args});
 
 int main(int argc, char* argv[]) {{
-    if (argc < 6) {{
-        fprintf(stderr, "Usage: %s <kernel.so> <kernel_name> <gridX> <gridY> <gridZ> [args...]\\n", argv[0]);
+    if (argc < 8) {{
+        fprintf(stderr, "Usage: %s <kernel.so> <kernel_name> <gridX_start> <gridX_end> <gridX_total> <gridY> <gridZ> [args...]\\n", argv[0]);
         return 1;
     }}
 
     const char* so_path = argv[1];
     const char* kernel_name = argv[2];
-    uint32_t gridX = (uint32_t)atoi(argv[3]);
-    uint32_t gridY = (uint32_t)atoi(argv[4]);
-    uint32_t gridZ = (uint32_t)atoi(argv[5]);
+    uint32_t gridX_start = (uint32_t)atoi(argv[3]);
+    uint32_t gridX_end = (uint32_t)atoi(argv[4]);
+    uint32_t gridX = (uint32_t)atoi(argv[5]);  // total gridX for kernel args
+    uint32_t gridY = (uint32_t)atoi(argv[6]);
+    uint32_t gridZ = (uint32_t)atoi(argv[7]);
 
     // Preload TritonCPURuntime stub to provide triton_assert, etc.
-    void* runtime_handle = dlopen("/tmp/libTritonCPURuntime_riscv.so", RTLD_NOW | RTLD_GLOBAL);
+    void* runtime_handle = dlopen("{_triton_C_dir}/libTritonCPURuntime_riscv.so", RTLD_NOW | RTLD_GLOBAL);
     if (!runtime_handle) {{
         fprintf(stderr, "Warning: Failed to preload TritonCPURuntime: %s\\n", dlerror());
     }}
@@ -540,10 +554,10 @@ int main(int argc, char* argv[]) {{
     // Parse arguments with correct types and handle shared memory
 {''.join(arg_defs)}
 
-    // Execute kernel for each grid point
+    // Execute kernel for grid slice [gridX_start, gridX_end)
     for (uint32_t gz = 0; gz < gridZ; gz++) {{
         for (uint32_t gy = 0; gy < gridY; gy++) {{
-            for (uint32_t gx = 0; gx < gridX; gx++) {{
+            for (uint32_t gx = gridX_start; gx < gridX_end; gx++) {{
                 uint32_t x = gx;
                 uint32_t y = gy;
                 uint32_t z = gz;
@@ -583,61 +597,93 @@ int main(int argc, char* argv[]) {{
                launch_metadata, launch_enter_hook, launch_exit_hook, *args):
         import ctypes
 
-        cmd = [_qemu_binary]
-        target_cpu_env = os.environ.get("TRITON_CPU_TARGET_CPU", "")
-        if ":" in target_cpu_env:
-            cmd += ["-cpu", target_cpu_env.split(":", 1)[1]]
-        qemu_lib_path = os.environ.get("TRITON_CPU_QEMU_LD_PATH")
-        if qemu_lib_path:
-            cmd += ["-L", qemu_lib_path]
+        # Build base command (without grid range)
+        base_cmd = [self.launcher_path, kernel_ptr, getattr(self.metadata, 'name', 'kernel')]
+        # grid range placeholder — will be filled per worker
+        # base_cmd += [gridX_start, gridX_end, gridY, gridZ]
 
-        cmd += [self.launcher_path, kernel_ptr, getattr(self.metadata, 'name', 'kernel'),
-                str(gridX), str(gridY), str(gridZ)]
-
-        tensor_info = []
+        arg_strs = []
         arg_idx = 0
+        # Track shared storage: map storage_ptr -> [shm_name, shm_path, storage_nbytes, has_output]
+        storage_map = {}
         for arg in args:
-            # we use shared memory file to pass tensor data so that we can share
-            # between qemu device and host via mmap
             if hasattr(arg, 'data_ptr'):
                 storage = arg.untyped_storage()
+                storage_ptr = storage.data_ptr()
+                storage_nbytes = len(storage)
                 storage_offset_bytes = arg.storage_offset() * arg.element_size()
-                nbytes = len(storage) - storage_offset_bytes
-                start_ptr = storage.data_ptr() + storage_offset_bytes
-
-                shm_name = f"triton_{os.getpid()}_{arg_idx}_{id(arg)}"
-                shm_path = self.shared_mem_dir + shm_name
-                with open(shm_path, "wb") as shm_f:
-                    data = bytes(ctypes.cast(start_ptr, ctypes.POINTER(ctypes.c_char * nbytes)).contents)
-                    shm_f.write(data)
-                cmd.append(f"{nbytes}:{shm_name}")
-
-                # Determine if this is an output parameter that needs copying back
                 is_output = self._is_output_arg(arg_idx)
-                tensor_info.append((arg, nbytes, shm_path, is_output))
+
+                # One shm file per unique storage
+                if storage_ptr not in storage_map:
+                    shm_name = f"triton_{os.getpid()}_{arg_idx}_{storage_ptr}"
+                    shm_path = self.shared_mem_dir + shm_name
+                    with open(shm_path, "wb") as shm_f:
+                        data = bytes(ctypes.cast(storage_ptr, ctypes.POINTER(ctypes.c_char * storage_nbytes)).contents)
+                        shm_f.write(data)
+                    storage_map[storage_ptr] = [shm_name, shm_path, storage_nbytes, is_output]
+                elif is_output:
+                    storage_map[storage_ptr][3] = True
+
+                shm_name = storage_map[storage_ptr][0]
+                arg_strs.append(f"{storage_nbytes}:{shm_name}:{storage_offset_bytes}")
             else:
-                cmd.append(str(arg) if isinstance(arg, (int, float)) else str(int(arg)))
+                arg_strs.append(str(arg) if isinstance(arg, (int, float)) else str(int(arg)))
             arg_idx += 1
 
         if launch_enter_hook:
             launch_enter_hook(launch_metadata)
-        result = subprocess.run(cmd, capture_output=True, timeout=10)
+
+        # Build QEMU command prefix
+        cmd_prefix = [_qemu_binary]
+        qemu_cpu = os.environ.get("TRITON_CPU_QEMU_CPU", "")
+        if not qemu_cpu:
+            target_cpu_env = os.environ.get("TRITON_CPU_TARGET_CPU", "")
+            if ":" in target_cpu_env:
+                qemu_cpu = target_cpu_env.split(":", 1)[1]
+        if qemu_cpu:
+            cmd_prefix += ["-cpu", qemu_cpu]
+        # cmd_prefix += ["-U", "LD_PRELOAD"]
+        cmd_prefix += ["-s", "67108864"]
+        qemu_lib_path = os.environ.get("TRITON_CPU_QEMU_LD_PATH")
+        if qemu_lib_path:
+            cmd_prefix += ["-L", qemu_lib_path]
+
+        # Split gridX across parallel QEMU workers
+        num_workers = min(int(os.environ.get("TRITON_CPU_QEMU_WORKERS", "4")), gridX)
+        num_workers = max(1, num_workers)
+        chunk = (gridX + num_workers - 1) // num_workers
+
+        def run_qemu_worker(worker_id):
+            gx_start = worker_id * chunk
+            gx_end = min(gx_start + chunk, gridX)
+            if gx_start >= gx_end:
+                return None
+            worker_cmd = cmd_prefix + base_cmd + [str(gx_start), str(gx_end), str(gridX), str(gridY), str(gridZ)] + arg_strs
+            return subprocess.run(worker_cmd, capture_output=True)
+
+        if num_workers == 1:
+            results = [run_qemu_worker(0)]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                results = list(pool.map(run_qemu_worker, range(num_workers)))
+
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
 
-        if result.returncode != 0:
-            raise RuntimeError(f"QEMU execution failed: {result.stderr.decode('utf-8', errors='replace')}")
+        for r in results:
+            if r is not None and r.returncode != 0:
+                stderr = r.stderr.decode('utf-8', errors='replace')
+                stdout = r.stdout.decode('utf-8', errors='replace')
+                raise RuntimeError(f"QEMU execution failed (rc={r.returncode}): stderr={stderr} stdout={stdout}")
 
-        # Read results from shared memory (only for output parameters)
-        for tensor, nbytes, shm_path, is_output in tensor_info:
-            if is_output:
-                # Copy modified data back from QEMU to host tensor
+        # Copy back only storages that contain output args
+        for storage_ptr, (shm_name, shm_path, storage_nbytes, has_output) in storage_map.items():
+            if has_output:
                 with open(shm_path, "rb") as shm_f:
-                    data = shm_f.read(nbytes)
-                    storage = tensor.untyped_storage()
-                    storage_offset_bytes = tensor.storage_offset() * tensor.element_size()
-                    start_ptr = storage.data_ptr() + storage_offset_bytes
-                    ctypes.memmove(start_ptr, data, nbytes)
+                    data = shm_f.read(storage_nbytes)
+                    ctypes.memmove(storage_ptr, data, storage_nbytes)
             os.unlink(shm_path)
 
     def __call__(self, *args, **kwargs):

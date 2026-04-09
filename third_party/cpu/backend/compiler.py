@@ -375,6 +375,9 @@ class CPUBackend(BaseBackend):
     def hash(self):
         # TODO: Get more detailed CPU info like raw brand name with supported ISAs.
         # Right now it would only return a simple string like "x86_64" or "aarch64".
+        # UPDATE: cpu info added
         import platform
 
-        return f"{platform.machine()}"
+        host = platform.machine()
+        target = f"{self.cpu_arch}-{self.cpu_name}-{','.join(sorted(self.cpu_features))}"
+        return f"{host}|{target}"
